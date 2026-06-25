@@ -1,4 +1,4 @@
-# coaling
+# coalign
 
 This project addresses the alignment problem between a pedigree and a coalescent tree that describes genetic transmissions within a given pedigree. Specifically, given the following inputs:
 
@@ -25,7 +25,7 @@ In other words, the goal is to find valid extensions of the initial assignments 
 
 ## Documentation
 
-The documentation for the project can be found [here](https://gravellab.github.io/coaling/).
+The documentation for the project can be found [here](https://gravellab.github.io/coalign/).
 
 ## Installation
 
