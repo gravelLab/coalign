@@ -157,3 +157,7 @@ cython_debug/
 
 logs
 .idea
+.vs/
+
+# Simulation results
+scripts/simulations/paper_final_version/**

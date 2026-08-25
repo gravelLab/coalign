@@ -34,20 +34,34 @@ def main():
     y_axis_option = get_number_input_in_bounds("Choose the y-axis type:", 1, 2)
 
     x_vals, y_vals = [], []
+    sizes = []
+    size_column_index = 2
     with open(input_csv_filepath, newline="") as csvfile:
         reader = csv.reader(csvfile)
         for row in reader:
             try:
                 x_vals.append(float(row[x_axis_column_index]))
                 y_vals.append(float(row[y_axis_column_index]))
+
+                alignment_value = float(row[size_column_index])
+                sizes.append((alignment_value ** 0.5) * 10)
             except (ValueError, IndexError):
                 continue  # skip bad rows
 
+    x_vals.append(55)
+    x_vals.append(75)
+    x_vals.append(85)
+    y_vals.append(0.5)
+    y_vals.append(0.5)
+    y_vals.append(0.5)
+    sizes.append((1000 ** 0.5) * 10)
+    sizes.append((10000 ** 0.5) * 10)
+    sizes.append((100000 ** 0.5) * 10)
     # Make the figure larger — increase figsize as needed
     plt.figure(figsize=(14, 10))  # larger canvas
 
     # Create scatter plot
-    plt.scatter(x_vals, y_vals, s=70, alpha=0.6)
+    plt.scatter(x_vals, y_vals, s=sizes, alpha=0.6)
 
     # Log scale options
     if x_axis_option == 2:
