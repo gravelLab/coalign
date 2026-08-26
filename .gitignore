@@ -160,4 +160,4 @@ logs
 .vs/
 
 # Simulation results
-scripts/simulations/paper_final_version/**
+scripts/simulations/plots/paper_final_version/**

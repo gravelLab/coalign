@@ -159,7 +159,7 @@ def main():
     plt.tick_params(axis="x", pad=40)
     plt.tick_params(axis="y", pad=40)
 
-    plt.xlim(min(x) - 0.5, max(x) + 0.5)
+    plt.xlim(3, max(x))
     # Use tight_layout for better adjustment
     # plt.tight_layout()
 
