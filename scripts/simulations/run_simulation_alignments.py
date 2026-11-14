@@ -1674,7 +1674,7 @@ def parse_arguments():
         "2": ["--error-dir", "--initial-dirs"],
         "3": ["--error-dir", "--initial-parent-dir", "--parallel", "--max-workers"],
         "4": ["--error-dir", "--parent-data-dir", "--parallel", "--max-workers"],
-        "9": ["--parent-data-dir", "--parallel"]
+        "9": ["--parent-data-dir", "--parallel", "--max-workers"]
     }
     # Arguments shared across all modes
     shared_arguments = ["--mode", "--simulation-name"]
@@ -1775,10 +1775,12 @@ def parse_arguments():
             )
         case "9":
             parallel_processing = arguments.parallel
+            max_workers = arguments.max_workers
             tree_pedigree_subdirectories(
                 parent_directory=parent_data_dir_path,
                 simulation_name=simulation_name,
-                run_parallel=parallel_processing
+                run_parallel=parallel_processing,
+                max_workers=max_workers
             )
 
 
