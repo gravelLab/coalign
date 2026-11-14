@@ -75,7 +75,6 @@ def draw_regression(x_vals, y_vals, regression_option: RegressionType):
         x_line = np.linspace(min(x_vals), max(x_vals), 100)
         y_line = model.predict(sm.add_constant(x_line))
         plt.plot(x_line, y_line, linewidth=3)
-        plt.ylim(-0.05, 1.05)
         return x_array, y_array, model
 
     # Print the parameters
@@ -233,14 +232,10 @@ def main():
             "Check the input file and column indexes."
         )
 
-    # Make the figure larger — increase figsize as needed
+    # Make the figure larger and choose the dot size
     plt.figure(figsize=(14, 10))  # larger canvas
-
-    # Create scatter plot
-    if size_column_index is not None:
-        plt.scatter(x_vals, y_vals, s=sizes, alpha=0.6)
-    else:
-        plt.scatter(x_vals, y_vals, s=70, alpha=0.6)
+    dot_size = sizes if size_column_index is not None else 70
+    plt.scatter(x_vals, y_vals, s=dot_size, alpha=0.6)
     # Log scale options
     if x_axis_option == AxisType.LOGARITHMIC:
         plt.xscale("log")

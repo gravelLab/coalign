@@ -36,10 +36,11 @@ phasing_accuracy_csv_filename = "phasing_accuracy.csv"
 partial_results_csv_filename = "partial_results.csv"
 classification_csv_header = ("proband_number,no_solutions,individual_and_spouses,individual_and_non_spouse,"
                              "no_individual_spouse,neither_individual_nor_spouse,"
-                             "neither_individual_nor_spouse_only_super_founders\n")
+                             "neither_individual_nor_spouse_only_super_founders,"
+                             "alignment_runtime_seconds\n")
 percentile_csv_header = ("proband_number,identity_percentile,number_of_alignments,selected_alignments_length,"
-                         "selected_alignments_ceiling\n")
-phasing_accuracy_csv_header = "proband_number, phasing_accuracy, weighted_phasing_accuracy\n"
+                         "selected_alignments_ceiling,running_time\n")
+phasing_accuracy_csv_header = "proband_number, phasing_accuracy, weighted_phasing_accuracy,running_time\n"
 results_dir_name = "results"
 
 # Alignment likelihoods
@@ -134,6 +135,7 @@ class AlignmentClassification:
         self.total_number_of_root_vertex_individual_assignments = 0
         self.initial_root_vertex_individual_assignments_number = 0
         self.root_assignment_occurrences = defaultdict(int)
+        self.total_alignment_runtime_seconds = 0.0
 
     def _add_root_assigment_dictionary(self, other_root_assignment_occurrences):
         for key, value in other_root_assignment_occurrences.items():
@@ -160,6 +162,7 @@ class AlignmentClassification:
         self.total_number_of_root_vertex_individual_assignments += (
             other_result.total_number_of_root_vertex_individual_assignments)
         self.total_simulation_number += other_result.total_simulation_number
+        self.total_alignment_runtime_seconds += other_result.total_alignment_runtime_seconds
         self._add_root_assigment_dictionary(other_result.root_assignment_occurrences)
         return self
 
@@ -169,7 +172,8 @@ class AlignmentClassification:
                f"{self.individual_and_non_spouse_present_counter},"
                f"{self.individual_not_present_spouse_present_counter},"
                f"{self.neither_individual_nor_spouse_present_counter},"
-               f"{self.superfounder_present_individual_and_spouses_not_present}\n")
+               f"{self.superfounder_present_individual_and_spouses_not_present},"
+               f"{self.total_alignment_runtime_seconds:.6f}\n")
         return row
 
     def is_empty(self):
@@ -342,8 +346,16 @@ class AbstractAlignmentTask(ABC):
             self.alignment_classification.no_solutions_counter += 1
         self.file_access.close_files()
 
-    @abstractmethod
     def run(self):
+        start_time = time.perf_counter()
+        try:
+            return self._run()
+        finally:
+            self.alignment_classification.total_alignment_runtime_seconds += (
+                time.perf_counter() - start_time)
+
+    @abstractmethod
+    def _run(self):
         pass
 
 
@@ -368,7 +380,7 @@ class AlignmentTask(AbstractAlignmentTask):
         self.alignment_edge_mode = alignment_edge_mode
         self.alignment_calculate_posterior_probabilities = alignment_calculate_posterior_probabilities
 
-    def run(self) -> (TreeAlignmentResults, CoalescentTree, PotentialMrcaProcessedGraph):
+    def _run(self) -> (TreeAlignmentResults, CoalescentTree, PotentialMrcaProcessedGraph):
         print(f"Parsing {self.pedigree_path} [{self.coalescent_tree_path}]")
         coalescent_tree = CoalescentTree.get_coalescent_tree_from_file(filepath=self.coalescent_tree_path)
         coalescent_tree.remove_unary_nodes()
@@ -452,7 +464,7 @@ class MaximumAlignableSubcladeTask(AbstractAlignmentTask):
             return None
         return file_numbers
 
-    def run(self) -> (int, AlignmentClassification, dict):
+    def _run(self) -> (int, AlignmentClassification, dict):
         proband_number = None
         processed_tree_subclade_paths = self.process_tree_subclades_directory()
         if not processed_tree_subclade_paths:
@@ -592,6 +604,9 @@ class BaseErrorAlignmentComparison(ABC):
             f"The number of simulations without the individual and all the spouses "
             f"where there is a superfounder: "
             f"{self.error_comparison_results.superfounder_present_individual_and_spouses_not_present}\n")
+        general_result_file.write(
+            f"Total alignment runtime: "
+            f"{self.error_comparison_results.total_alignment_runtime_seconds:.6f} seconds\n")
         general_result_file.write(line_content_divider)
         general_result_file.write(
             f"Initial number of individual candidates for the root: "
@@ -870,6 +885,8 @@ def save_alignment_results_to_file(filepath: str | Path, error_alignments_result
         results_file.write(f"The number of simulations without individual and spouses where the rest "
                            f"are super founders: "
                            f"{error_alignments_results.superfounder_present_individual_and_spouses_not_present}\n")
+        results_file.write(f"Total alignment runtime: "
+                           f"{error_alignments_results.total_alignment_runtime_seconds:.6f} seconds\n")
 
 
 def save_candidate_appearances(filepath: str | Path, error_alignments_results: AlignmentClassification):
@@ -995,9 +1012,18 @@ def specific_error_pedigree_directories_mode():
     os.chdir(error_pedigrees_directory_path)
     input_simulation_subpath = get_non_existing_path("Specify the simulation subpath:")
     os.chdir(current_working_directory)
+    parallel_processing = get_yes_or_no("Do you want to parallelize the alignments?")
+    max_workers = None
+    if parallel_processing:
+        max_workers = get_natural_number_with_lower_bound(
+            input_request="Specify the number of worker processes to be used (at least 2): ",
+            lower_bound=2
+        )
     run_specific_error_pedigree_directories(paths=paths,
                                             error_pedigrees_folder_path=error_pedigrees_directory_path,
-                                            simulation_subpath=input_simulation_subpath)
+                                            simulation_subpath=input_simulation_subpath,
+                                            parallelize=parallel_processing,
+                                            max_workers=max_workers)
 
 
 def get_absolute_paths_to_subfolders(directory_path: str | Path) -> list[str]:
@@ -1355,7 +1381,7 @@ def run_perfect_data_alignment_and_calculate_statistics(proband_simulation_path,
     total_weighted_phasing_accuracy = sum(weighted_phasing_accuracies)
     return (alignment_task, proband_simulation_path, proband_number, identity_percentile,
             alignment_number, selected_alignments_length, ceiling_selected_length,
-            total_phasing_accuracy, total_weighted_phasing_accuracy)
+            total_phasing_accuracy, total_weighted_phasing_accuracy, )
 
 
 # Dummy executor for profiling
@@ -1380,7 +1406,8 @@ class DummyExecutor:
 
 def run_tree_pedigree_subdirectories_results(proband_number_to_results: dict,
                                              simulation_directory_path: str | Path,
-                                             run_parallel=True):
+                                             run_parallel: bool = True,
+                                             max_workers: int | None = None):
     # Run the alignments and save the likelihoods
     alignment_classifications = []
     results_csv_filepath = simulation_directory_path / results_csv_filename
@@ -1397,8 +1424,8 @@ def run_tree_pedigree_subdirectories_results(proband_number_to_results: dict,
             print("Running in parallel")
         else:
             print("Running sequentially")
-        Executor = ProcessPoolExecutor if run_parallel else DummyExecutor
-        with Executor() as executor:
+        executor = ProcessPoolExecutor(max_workers=max_workers) if run_parallel else DummyExecutor()
+        with executor:
             futures = []
             # Prepare the alignment tasks
             for proband_simulation_path, proband_alignment_tasks in proband_number_to_results.items():
@@ -1418,16 +1445,19 @@ def run_tree_pedigree_subdirectories_results(proband_number_to_results: dict,
                  ceiling_selected_length,
                  total_phasing_accuracy,
                  total_weighted_phasing_accuracy) = result
+                alignment_classifications: AlignmentClassification = alignment_task.alignment_classification
+                total_alignment_runtime_seconds = alignment_classifications.total_alignment_runtime_seconds
                 percentile_csv_file.write(f"{proband_number},{identity_percentile},"
                                           f"{alignment_number},{selected_alignments_length},"
-                                          f"{ceiling_selected_length}\n")
+                                          f"{ceiling_selected_length},{total_alignment_runtime_seconds}\n")
                 percentile_csv_file.flush()
                 phasing_accuracy_csv_file.write(f"{proband_number},{total_phasing_accuracy},"
-                                                f"{total_weighted_phasing_accuracy}\n")
+                                                f"{total_weighted_phasing_accuracy},"
+                                                f"{total_alignment_runtime_seconds}\n")
                 phasing_accuracy_csv_file.flush()
                 # The calculation is done in a different process, so we can't look up the results from the task list
                 proband_simulation_path_to_alignment_classifications[proband_simulation_path].append(
-                    alignment_task.alignment_classification
+                    alignment_classifications
                 )
         # Process the alignment results. These results are accumulated before writing
         for proband_simulation_path, alignment_classifications in proband_simulation_path_to_alignment_classifications.items():
@@ -1448,11 +1478,18 @@ def run_tree_pedigree_subdirectories_results(proband_number_to_results: dict,
 
 
 def tree_pedigree_subdirectories(parent_directory: str = None, simulation_name: str = None,
-                                 run_parallel: bool = False):
+                                 run_parallel: bool | None = None, max_workers: int | None = None):
     if not parent_directory:
         parent_directory = get_directory_path("Specify the path to the parent directory:")
     if not simulation_name:
         simulation_name = get_non_empty_string("Specify the simulation name:")
+    if run_parallel is None:
+        run_parallel = get_yes_or_no("Do you want to parallelize the alignments?")
+    if run_parallel and max_workers is None:
+        max_workers = get_natural_number_with_lower_bound(
+            input_request="Specify the number of worker processes to be used (at least 2): ",
+            lower_bound=2
+        )
     parent_directory = Path(parent_directory)
     results_directory_path = parent_directory / results_dir_name
     os.makedirs(results_directory_path, exist_ok=True)
@@ -1466,7 +1503,8 @@ def tree_pedigree_subdirectories(parent_directory: str = None, simulation_name: 
     )
     alignment_classifications = run_tree_pedigree_subdirectories_results(proband_simulation_path_to_results,
                                                                          simulation_directory_path,
-                                                                         run_parallel=run_parallel)
+                                                                         run_parallel=run_parallel,
+                                                                         max_workers=max_workers)
     return alignment_classifications
 
 
