@@ -25,6 +25,7 @@ from scripts.alignment_statistics.alignment_similarity import calculate_percenta
 from scripts.simulations.tree_error_simulation.simulate_resolve_polytomy_tree_error import oracle_filename
 from scripts.utility.alignment_utility import parse_dictionary_from_file
 from scripts.utility.basic_utility import *
+from scripts.utility.resource_monitoring import PeakMemoryMonitor
 
 log_directory = "log_dir"
 initial_alignment_dir_name = "initial_alignment"
@@ -37,10 +38,13 @@ partial_results_csv_filename = "partial_results.csv"
 classification_csv_header = ("proband_number,no_solutions,individual_and_spouses,individual_and_non_spouse,"
                              "no_individual_spouse,neither_individual_nor_spouse,"
                              "neither_individual_nor_spouse_only_super_founders,"
-                             "alignment_runtime_seconds\n")
+                             "alignment_runtime_seconds,max_peak_memory_mib,max_memory_increase_mib\n")
+# The memory columns: the peak RSS of the process during the alignment and its increase over the RSS
+# right before the alignment started (both in MiB)
 percentile_csv_header = ("proband_number,identity_percentile,number_of_alignments,selected_alignments_length,"
-                         "selected_alignments_ceiling,running_time\n")
-phasing_accuracy_csv_header = "proband_number, phasing_accuracy, weighted_phasing_accuracy,running_time\n"
+                         "selected_alignments_ceiling,running_time,peak_memory_mib,memory_increase_mib\n")
+phasing_accuracy_csv_header = ("proband_number, phasing_accuracy, weighted_phasing_accuracy,running_time,"
+                               "peak_memory_mib,memory_increase_mib\n")
 results_dir_name = "results"
 
 # Alignment likelihoods
@@ -136,6 +140,16 @@ class AlignmentClassification:
         self.initial_root_vertex_individual_assignments_number = 0
         self.root_assignment_occurrences = defaultdict(int)
         self.total_alignment_runtime_seconds = 0.0
+        # The maximum (over all the alignments) peak RSS of the process during an alignment, in MiB
+        self.max_peak_memory_mib = 0.0
+        # The maximum (over all the alignments) increase of the RSS over its value before the alignment, in MiB
+        self.max_memory_increase_mib = 0.0
+
+    def record_alignment_resources(self, runtime_seconds: float, peak_memory_mib: float,
+                                   memory_increase_mib: float):
+        self.total_alignment_runtime_seconds += runtime_seconds
+        self.max_peak_memory_mib = max(self.max_peak_memory_mib, peak_memory_mib)
+        self.max_memory_increase_mib = max(self.max_memory_increase_mib, memory_increase_mib)
 
     def _add_root_assigment_dictionary(self, other_root_assignment_occurrences):
         for key, value in other_root_assignment_occurrences.items():
@@ -163,6 +177,8 @@ class AlignmentClassification:
             other_result.total_number_of_root_vertex_individual_assignments)
         self.total_simulation_number += other_result.total_simulation_number
         self.total_alignment_runtime_seconds += other_result.total_alignment_runtime_seconds
+        self.max_peak_memory_mib = max(self.max_peak_memory_mib, other_result.max_peak_memory_mib)
+        self.max_memory_increase_mib = max(self.max_memory_increase_mib, other_result.max_memory_increase_mib)
         self._add_root_assigment_dictionary(other_result.root_assignment_occurrences)
         return self
 
@@ -173,7 +189,9 @@ class AlignmentClassification:
                f"{self.individual_not_present_spouse_present_counter},"
                f"{self.neither_individual_nor_spouse_present_counter},"
                f"{self.superfounder_present_individual_and_spouses_not_present},"
-               f"{self.total_alignment_runtime_seconds:.6f}\n")
+               f"{self.total_alignment_runtime_seconds:.6f},"
+               f"{self.max_peak_memory_mib:.3f},"
+               f"{self.max_memory_increase_mib:.3f}\n")
         return row
 
     def is_empty(self):
@@ -347,12 +365,19 @@ class AbstractAlignmentTask(ABC):
         self.file_access.close_files()
 
     def run(self):
+        memory_monitor = PeakMemoryMonitor()
+        memory_monitor.start()
         start_time = time.perf_counter()
         try:
             return self._run()
         finally:
-            self.alignment_classification.total_alignment_runtime_seconds += (
-                time.perf_counter() - start_time)
+            runtime_seconds = time.perf_counter() - start_time
+            memory_monitor.stop()
+            self.alignment_classification.record_alignment_resources(
+                runtime_seconds=runtime_seconds,
+                peak_memory_mib=memory_monitor.peak_rss_mib,
+                memory_increase_mib=memory_monitor.peak_rss_increase_mib
+            )
 
     @abstractmethod
     def _run(self):
@@ -607,6 +632,10 @@ class BaseErrorAlignmentComparison(ABC):
         general_result_file.write(
             f"Total alignment runtime: "
             f"{self.error_comparison_results.total_alignment_runtime_seconds:.6f} seconds\n")
+        general_result_file.write(
+            f"Maximum peak memory of an alignment: "
+            f"{self.error_comparison_results.max_peak_memory_mib:.3f} MiB "
+            f"(maximum increase: {self.error_comparison_results.max_memory_increase_mib:.3f} MiB)\n")
         general_result_file.write(line_content_divider)
         general_result_file.write(
             f"Initial number of individual candidates for the root: "
@@ -887,6 +916,9 @@ def save_alignment_results_to_file(filepath: str | Path, error_alignments_result
                            f"{error_alignments_results.superfounder_present_individual_and_spouses_not_present}\n")
         results_file.write(f"Total alignment runtime: "
                            f"{error_alignments_results.total_alignment_runtime_seconds:.6f} seconds\n")
+        results_file.write(f"Maximum peak memory of an alignment: "
+                           f"{error_alignments_results.max_peak_memory_mib:.3f} MiB "
+                           f"(maximum increase: {error_alignments_results.max_memory_increase_mib:.3f} MiB)\n")
 
 
 def save_candidate_appearances(filepath: str | Path, error_alignments_results: AlignmentClassification):
@@ -1447,13 +1479,18 @@ def run_tree_pedigree_subdirectories_results(proband_number_to_results: dict,
                  total_weighted_phasing_accuracy) = result
                 alignment_classifications: AlignmentClassification = alignment_task.alignment_classification
                 total_alignment_runtime_seconds = alignment_classifications.total_alignment_runtime_seconds
+                # Every task runs a single alignment, so the maximum values are the values for this alignment
+                peak_memory_mib = alignment_classifications.max_peak_memory_mib
+                memory_increase_mib = alignment_classifications.max_memory_increase_mib
+                resources_columns = (f"{total_alignment_runtime_seconds},"
+                                     f"{peak_memory_mib:.3f},{memory_increase_mib:.3f}")
                 percentile_csv_file.write(f"{proband_number},{identity_percentile},"
                                           f"{alignment_number},{selected_alignments_length},"
-                                          f"{ceiling_selected_length},{total_alignment_runtime_seconds}\n")
+                                          f"{ceiling_selected_length},{resources_columns}\n")
                 percentile_csv_file.flush()
                 phasing_accuracy_csv_file.write(f"{proband_number},{total_phasing_accuracy},"
                                                 f"{total_weighted_phasing_accuracy},"
-                                                f"{total_alignment_runtime_seconds}\n")
+                                                f"{resources_columns}\n")
                 phasing_accuracy_csv_file.flush()
                 # The calculation is done in a different process, so we can't look up the results from the task list
                 proband_simulation_path_to_alignment_classifications[proband_simulation_path].append(

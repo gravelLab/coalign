@@ -1,5 +1,4 @@
 import math
-import threading
 from abc import ABC
 from collections import defaultdict, Counter
 from dataclasses import dataclass
@@ -14,12 +13,90 @@ from alignment.configuration import section_separator, subsection_separator, sav
     PosteriorProbabilitiesCalculationMode, save_edge_to_path_map
 from alignment.potential_mrca_processed_graph import PotentialMrcaProcessedGraph
 from scripts.utility.alignment_utility import convert_ploid_id_to_individual
-from scripts.utility.basic_utility import round_down, float_not_greater, verify_and_cap_probability
+from scripts.utility.basic_utility import round_down, float_not_greater, verify_and_cap_probability, prepend_to_file
 
 
-def save_text_to_file(text: str, path: str):
-    with open(path, "a") as f:
-        f.write(text)
+# The buffer size used when streaming the alignment results into a file
+result_file_buffer_size = 1024 * 1024
+
+# The posterior likelihood of a vertex alignment is only known after all the vertex alignments of the clade have been
+# found, while the alignment file is written as soon as the vertex alignment is found. Therefore, the first line of
+# the file is reserved for the likelihood: it is written with a placeholder value of a fixed width, which is
+# overwritten in place later (see fill_posterior_likelihood_placeholder)
+posterior_likelihood_line_prefix = "Posterior alignment likelihood: "
+posterior_likelihood_placeholder_value = "pending"
+# The maximum length of str(round_down(probability)) for a probability in [0, 1] (e.g. "0.99999")
+posterior_likelihood_value_width = len(posterior_likelihood_placeholder_value)
+
+
+def fill_posterior_likelihood_placeholder(filepath: str | Path, rounded_likelihood: float):
+    """
+    Replaces the posterior likelihood placeholder at the beginning of the alignment file with the actual value.
+    The value is padded with spaces to the width of the placeholder, so that the rest of the file is not moved.
+    If the file doesn't have the placeholder, the likelihood line is prepended to the file instead.
+    """
+    value = str(rounded_likelihood)
+    placeholder = f"{posterior_likelihood_line_prefix}{posterior_likelihood_placeholder_value}".encode("ascii")
+    if len(value) <= posterior_likelihood_value_width:
+        with open(filepath, "r+b") as file:
+            if file.read(len(placeholder)) == placeholder:
+                file.seek(0)
+                file.write(f"{posterior_likelihood_line_prefix}"
+                           f"{value.ljust(posterior_likelihood_value_width)}".encode("ascii"))
+                return
+    prepend_to_file(filepath, f"{posterior_likelihood_line_prefix}{value}\n{section_separator}")
+
+
+class _PathFormatter:
+    """
+    Formats pedigree paths for the result files, caching the results within a single file write.
+
+    The same path lists are shared between many edge alignments of a vertex alignment, so every path is formatted
+    only once. The paths are cached by their id, so a formatter must only be used while the formatted paths are alive
+    and unchanged (i.e. within a single write).
+    """
+
+    def __init__(self):
+        self._vertex_to_string: dict[int, str] = dict()
+        self._path_id_to_string: dict[int, str] = dict()
+
+    def format_vertices(self, vertices) -> str:
+        cache = self._vertex_to_string
+        parts = []
+        for vertex in vertices:
+            vertex_string = cache.get(vertex)
+            if vertex_string is None:
+                vertex_string = convert_ploid_id_to_individual(vertex)
+                cache[vertex] = vertex_string
+            parts.append(vertex_string)
+        return ", ".join(parts)
+
+    def format_shared_path(self, path) -> str:
+        key = id(path)
+        path_string = self._path_id_to_string.get(key)
+        if path_string is None:
+            path_string = self.format_vertices(path)
+            self._path_id_to_string[key] = path_string
+        return path_string
+
+
+def _get_edge_alignment_layout(tree: CoalescentTree, vertex_alignment, padding=4 * ' '):
+    """
+    Returns the order in which the edges of an edge alignment are written together with the pre-formatted text.
+
+    Returns:
+        A list of (vertex_header, [(edge, edge_line_prefix)]) tuples, one for every non-leaf vertex of the clade.
+    """
+    layout = []
+    for level in tree.get_levels()[1:]:
+        for vertex in level:
+            # Skip the vertices from other clades
+            if vertex not in vertex_alignment:
+                continue
+            edges = [((vertex_child, vertex), f"{padding}({vertex_child}, {vertex}): [")
+                     for vertex_child in tree.get_children(vertex)]
+            layout.append((f"{vertex}:\n", edges))
+    return layout
 
 
 def get_vertex_alignment_estimated_length(coalescent_tree: CoalescentTree, pedigree: PotentialMrcaProcessedGraph,
@@ -105,9 +182,10 @@ class FullAlignmentResult(AlignmentResult):
 
     def save_to_file(self, filepath: str | Path, tree: CoalescentTree):
         self.result_filepath = filepath
-        text = self._prepare_text_for_writing(tree=tree)
-        # Launch the IO operation on a separate thread
-        threading.Thread(target=save_text_to_file, args=(text, filepath), daemon=True).start()
+        # The text is streamed into the file instead of being built in memory first, as the edge alignments
+        # of a single vertex alignment can produce many megabytes of text
+        with open(filepath, "a", buffering=result_file_buffer_size) as file:
+            self._write_text(write=file.write, tree=tree)
 
     @staticmethod
     def format_path(path_to_format):
@@ -115,36 +193,32 @@ class FullAlignmentResult(AlignmentResult):
         return ", ".join(path_to_format)
 
     @staticmethod
-    def _save_edge_alignment(text_lines: list[str], vertex_alignment, edge_alignment, tree: CoalescentTree,
-                             padding=4 * ' '):
-        tree_levels = tree.get_levels()[1:]
-        for level in tree_levels:
-            for vertex in level:
-                # Skip the vertices from other clades
-                if vertex not in vertex_alignment:
-                    continue
-                vertex_children = tree.get_children(vertex)
-                text_lines.append(f"{vertex}:\n")
-                for vertex_child in vertex_children:
-                    edge_mapping = edge_alignment[(vertex_child, vertex)]
-                    formatted_path = FullAlignmentResult.format_path(edge_mapping)
-                    text_lines.append(f"{padding}({vertex_child}, {vertex}): [{formatted_path}]\n")
+    def _write_edge_alignment(write, edge_alignment, layout, path_formatter: _PathFormatter):
+        lines = []
+        for vertex_header, edges in layout:
+            lines.append(vertex_header)
+            for edge, edge_line_prefix in edges:
+                formatted_path = path_formatter.format_shared_path(edge_alignment[edge])
+                lines.append(f"{edge_line_prefix}{formatted_path}]\n")
+        write("".join(lines))
 
     @staticmethod
-    def _save_edge_alignments(text_lines: list[str], alignment, edge_alignments, tree: CoalescentTree):
+    def _write_edge_alignments(write, alignment, edge_alignments, tree: CoalescentTree,
+                               path_formatter: _PathFormatter):
         if not save_edge_alignments:
             return
         count = len(edge_alignments)
-        text_lines.append(subsection_separator)
+        write(subsection_separator)
         verb = "is" if count == 1 else "are"
         noun = "alignment" if count == 1 else "alignments"
-        text_lines.append(f"There {verb} {count} edge {noun}\n")
-        text_lines.append(subsection_separator)
+        write(f"There {verb} {count} edge {noun}\n")
+        write(subsection_separator)
+        layout = _get_edge_alignment_layout(tree=tree, vertex_alignment=alignment)
         # Print the edge alignments
         for edge_alignment in edge_alignments:
-            FullAlignmentResult._save_edge_alignment(text_lines=text_lines, vertex_alignment=alignment,
-                                                     edge_alignment=edge_alignment, tree=tree)
-            text_lines.append(subsection_separator)
+            FullAlignmentResult._write_edge_alignment(write=write, edge_alignment=edge_alignment, layout=layout,
+                                                      path_formatter=path_formatter)
+            write(subsection_separator)
 
     def calculate_alignment_probabilities(self, calculation_mode: PosteriorProbabilitiesCalculationMode):
         if calculation_mode == PosteriorProbabilitiesCalculationMode.SKIP:
@@ -205,34 +279,34 @@ class FullAlignmentResult(AlignmentResult):
                 edge_to_path_map[edge].add(tuple(path))
         return edge_to_path_map
 
-    def _save_edge_to_path_map(self, text_lines: list[str], edge_alignments):
+    def _write_edge_to_path_map(self, write, edge_alignments, path_formatter: _PathFormatter):
         def print_edge_to_path_map():
             path_padding = 4 * ' '
-            text_lines.append("These are all the possible paths for every edge:\n")
+            write("These are all the possible paths for every edge:\n")
             for edge_to_print, paths_to_print in edge_to_path_map.items():
                 paths_count = len(paths_to_print)
                 noun = "option" if paths_count == 1 else "options"
-                text_lines.append(f"{edge_to_print} ({paths_count} {noun}):\n")
+                write(f"{edge_to_print} ({paths_count} {noun}):\n")
                 for path_to_print in paths_to_print:
-                    formatted_path = self.format_path(path_to_print)
-                    text_lines.append(f"{path_padding}[{formatted_path}]\n")
+                    formatted_path = path_formatter.format_vertices(path_to_print)
+                    write(f"{path_padding}[{formatted_path}]\n")
 
         if not save_edge_to_path_map:
             return
         edge_to_path_map = self._build_edge_to_path_map(edge_alignments=edge_alignments)
         count = len(edge_alignments)
         # Identify whether the alignments are simply the Cartesian product of all the assignments for the edges
-        text_lines.append(subsection_separator)
+        write(subsection_separator)
         cartesian_product_size = math.prod(len(v) for v in edge_to_path_map.values())
         if count == cartesian_product_size:
-            text_lines.append(f"The set of all the {count} edge alignments is just the Cartesian product.\n"
-                              "In other words, you can pick any possible path for every edge\n")
+            write(f"The set of all the {count} edge alignments is just the Cartesian product.\n"
+                  "In other words, you can pick any possible path for every edge\n")
         else:
-            text_lines.append(f"There are {cartesian_product_size - count} rejected edge alignments our of all "
-                              f"{cartesian_product_size} theoretically possible (the Cartesian product)\n")
+            write(f"There are {cartesian_product_size - count} rejected edge alignments our of all "
+                  f"{cartesian_product_size} theoretically possible (the Cartesian product)\n")
         print_edge_to_path_map()
-        text_lines.append(subsection_separator)
-        text_lines.append(f"Below are the unavoidable vertices for every edge:\n")
+        write(subsection_separator)
+        write(f"Below are the unavoidable vertices for every edge:\n")
         # Identify the unavoidable vertices for every edge
         for edge, paths in edge_to_path_map.items():
             if not paths:
@@ -242,36 +316,38 @@ class FullAlignmentResult(AlignmentResult):
                 unavoidable_vertices = set(next(iterator))
                 for path in iterator:
                     unavoidable_vertices.intersection_update(path)
-            formatted_vertices = self.format_path(unavoidable_vertices)
-            text_lines.append(f"{edge}: [{formatted_vertices}]\n")
+            formatted_vertices = path_formatter.format_vertices(unavoidable_vertices)
+            write(f"{edge}: [{formatted_vertices}]\n")
 
-    def _prepare_text_for_writing(self, tree: CoalescentTree):
-        text_lines = []
+    def _write_text(self, write, tree: CoalescentTree):
+        path_formatter = _PathFormatter()
+        if self.posterior_probabilities is not None:
+            # The posterior probabilities of the vertex alignments will be calculated once all the vertex
+            # alignments are found, so reserve the line for this alignment's posterior likelihood
+            write(f"{posterior_likelihood_line_prefix}{posterior_likelihood_placeholder_value}\n"
+                  f"{section_separator}")
         alignment = self.vertex_alignment
         for key, value in alignment.items():
             converted_value = convert_ploid_id_to_individual(value)
-            text_lines.append(f"{key}: {converted_value}\n")
+            write(f"{key}: {converted_value}\n")
         if self.example_edge_alignment is not None:
-            text_lines.append(section_separator)
-            text_lines.append(f"Example edge alignment:\n")
-            FullAlignmentResult._save_edge_alignment(text_lines=text_lines, vertex_alignment=alignment,
-                                                     edge_alignment=self.example_edge_alignment,
-                                                     tree=tree)
+            write(section_separator)
+            write(f"Example edge alignment:\n")
+            layout = _get_edge_alignment_layout(tree=tree, vertex_alignment=alignment)
+            FullAlignmentResult._write_edge_alignment(write=write, edge_alignment=self.example_edge_alignment,
+                                                      layout=layout, path_formatter=path_formatter)
         elif self.edge_alignments is not None:
-            text_lines.append(section_separator)
+            write(section_separator)
             edge_alignments = self.edge_alignments
             if not edge_alignments:
-                text_lines.append("There are no edges in the clade. Therefore, there are 0 edge alignments\n")
-                full_text = "".join(text_lines)
-                return full_text
+                write("There are no edges in the clade. Therefore, there are 0 edge alignments\n")
+                return
             # Save the edge to path map
-            self._save_edge_to_path_map(text_lines=text_lines,
-                                        edge_alignments=edge_alignments)
+            self._write_edge_to_path_map(write=write, edge_alignments=edge_alignments,
+                                         path_formatter=path_formatter)
             # Save edge alignments
-            self._save_edge_alignments(text_lines=text_lines, alignment=alignment,
-                                       edge_alignments=edge_alignments, tree=tree)
-        full_text = "".join(text_lines)
-        return full_text
+            self._write_edge_alignments(write=write, alignment=alignment, edge_alignments=edge_alignments,
+                                        tree=tree, path_formatter=path_formatter)
 
 
 def verify_probabilities_values(inclusion_probability_dictionary: dict[int, float]):

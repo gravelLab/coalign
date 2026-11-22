@@ -118,7 +118,7 @@ def get_store_vertex_alignment_callback():
     result = TreeAlignmentResults(
         clade_root_to_clade_results={}
     )
-    return result, partial(store_vertex_alignment_callback, result_dict=result)
+    return result, partial(store_vertex_alignment_callback, result=result)
 
 
 def process_pedigree_tree_directory(directory: str, result_directory_name: str):

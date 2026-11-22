@@ -8,12 +8,12 @@ from typing import Iterable
 from lineagekit.core.CoalescentTree import CoalescentTree
 
 from alignment.alignment_result import FullAlignmentResult, get_vertex_alignment_estimated_length, \
-    FailedClimbingCladeAlignmentResults, SuccessCladeAlignmentResults
+    FailedClimbingCladeAlignmentResults, SuccessCladeAlignmentResults, fill_posterior_likelihood_placeholder
 from alignment.configuration import calculate_distances_histogram, section_separator
 from alignment.potential_mrca_processed_graph import PotentialMrcaProcessedGraph
 from scripts.alignment_statistics.alignment_similarity import get_alignments_similarity, get_alignments_ind_similarity
 from scripts.utility.alignment_utility import convert_ploid_id_to_individual
-from scripts.utility.basic_utility import prepend_to_file, round_down
+from scripts.utility.basic_utility import round_down
 
 
 def calculate_coalescent_vertex_pedigree_candidates(clade_alignment_result: [FullAlignmentResult]):
@@ -210,8 +210,8 @@ class SuccessCladeAlignmentMetadata(CladeAlignmentMetadata):
             rounded_alignment_likelihood = round_down(alignment_likelihood)
             alignment_filename = f"alignment_{index}"
             alignment_path = self.results_filepath / alignment_filename
-            prefix_string = f"Posterior alignment likelihood: {rounded_alignment_likelihood}\n{section_separator}"
-            prepend_to_file(alignment_path, prefix_string)
+            # The first line of the alignment file is reserved for the likelihood, so the file is not rewritten
+            fill_posterior_likelihood_placeholder(alignment_path, rounded_alignment_likelihood)
 
     def _save_alignment_individual_metadata(self):
         self._save_alignments_posterior_probabilities()
